@@ -162,13 +162,9 @@ class ProxyPool:
 
 async def _probe(url: str, timeout_s: float) -> str:
     try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=False) as client:
             resp = await client.get(url)
-            if 200 <= resp.status_code < 300:
-                return "up"
-            if resp.status_code >= 500:
-                return "down"
-            return "up"
+            return "up" if 200 <= resp.status_code < 300 else "down"
     except Exception:
         return "down"
 
@@ -187,18 +183,37 @@ class MonitorLoop:
         self._on_cycle_done = on_cycle_done
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop_event.clear()
-            self._task = asyncio.create_task(
-                self._loop(), name="monitor-loop"
-            )
+            self._wake_event.clear()
+            self._task = asyncio.create_task(self._loop(), name="monitor-loop")
+
+    def wake(self) -> None:
+        self._wake_event.set()
 
     async def stop(self) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         if self._task:
             await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _sleep_or_wake(self, timeout: float) -> None:
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        wake_task = asyncio.create_task(self._wake_event.wait())
+        try:
+            await asyncio.wait(
+                {stop_task, wake_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (stop_task, wake_task):
+                if not task.done():
+                    task.cancel()
+            self._wake_event.clear()
 
     async def _loop(self) -> None:
         logger.info("Monitor loop started.")
@@ -209,10 +224,5 @@ class MonitorLoop:
                 await self._on_cycle_done(total, up, down, failed_ids)
             except Exception:
                 logger.exception("Error in monitor loop.")
-            try:
-                await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=float(interval)
-                )
-            except asyncio.TimeoutError:
-                pass
+            await self._sleep_or_wake(float(interval))
         logger.info("Monitor loop stopped.")
